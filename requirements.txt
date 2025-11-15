@@ -1,19 +1,66 @@
 # Основные зависимости для проекта Semantic Contamination
+# Обновлено: 2025-11-15 (Tier 1 Implementation)
 
-# Для работы с LLM API (если потребуется)
-# openai>=1.0.0
-# anthropic>=0.3.0
+# ============================================
+# LLM APIs - для reasoning вместо эвристик
+# ============================================
+openai>=1.0.0              # OpenAI GPT-4/3.5 для основного reasoning
+anthropic>=0.3.0           # Claude как альтернатива OpenAI
 
-# Обработка данных
-pandas>=2.0.0
-numpy>=1.24.0
+# ============================================
+# Reasoning & Orchestration
+# ============================================
+langchain>=0.1.0           # Framework для ReAct, chains, agents
+langchain-community>=0.0.38 # Community tools и integrations
+langchain-openai>=0.0.5    # OpenAI integration для LangChain
 
-# Веб-поиск (опционально)
-# requests>=2.31.0
-# beautifulsoup4>=4.12.0
+# ============================================
+# ML Models - для локального inference
+# ============================================
+transformers>=4.36.0       # HuggingFace transformers (для PairRM)
+torch>=2.0.0               # PyTorch backend для transformers
+sentence-transformers>=2.2.0 # Semantic similarity models
 
-# Анализ текста
-regex>=2023.0.0
+# Примечание: Для CPU-only установки (экономия места):
+# pip install torch --index-url https://download.pytorch.org/whl/cpu
 
-# Логирование и утилиты
-python-dateutil>=2.8.0
+# ============================================
+# Web Search - для фактчекинга
+# ============================================
+google-search-results>=2.4.2  # SerpAPI wrapper для веб-поиска
+requests>=2.31.0           # HTTP requests для web scraping
+beautifulsoup4>=4.12.0     # HTML parsing
+
+# ============================================
+# Hallucination Detection
+# ============================================
+selfcheckgpt>=0.1.0        # SelfCheck для детекции галлюцинаций
+
+# ============================================
+# Utilities
+# ============================================
+python-dotenv>=1.0.0       # Загрузка переменных окружения из .env
+pydantic>=2.0.0            # Валидация данных и settings management
+tiktoken>=0.5.0            # Tokenization для cost tracking
+
+# ============================================
+# Data Processing - существующие
+# ============================================
+pandas>=2.0.0              # Табличные данные (TSV/CSV)
+numpy>=1.24.0              # Численные операции
+
+# ============================================
+# Text Processing - существующие
+# ============================================
+regex>=2023.0.0            # Регулярные выражения
+
+# ============================================
+# Logging & Utilities - существующие
+# ============================================
+python-dateutil>=2.8.0     # Работа с датами
+
+# ============================================
+# Optional: Development Dependencies
+# ============================================
+# Для установки dev зависимостей используйте:
+# pip install -r requirements-dev.txt
