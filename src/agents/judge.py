@@ -1,9 +1,37 @@
 """
 Агент для слепого парного судейства тезисов по критериям (Шаг 5)
+
+ОБНОВЛЕНО (Шаг 5):
+- Интегрирован PairRM (llm-blender/PairRM) для SOTA парного ранжирования
+- Добавлена LLM поддержка для сложных случаев
+- Сохранены эвристики как final fallback
+- 3-уровневая graceful degradation
 """
 import random
-from typing import List, Dict, Tuple
+import logging
+from typing import List, Dict, Tuple, Optional
 from .base_agent import BaseAgent
+
+# PairRM imports (опциональные)
+try:
+    from ..models import PairRMRanker
+    HAS_PAIRRM = True
+except ImportError:
+    HAS_PAIRRM = False
+    PairRMRanker = None
+
+# LLM imports (опциональные)
+try:
+    from ..llm import get_default_llm, LLMClient
+    HAS_LLM = True
+except ImportError:
+    HAS_LLM = False
+    get_default_llm = None
+    LLMClient = None
+
+from ..config import settings
+
+logger = logging.getLogger(__name__)
 
 
 class JudgeAgent(BaseAgent):
@@ -17,8 +45,68 @@ class JudgeAgent(BaseAgent):
         'C5': 'Проверяемость и источники'
     }
 
-    def __init__(self, prompt_template_path: str = "prompts/judge_prompt.md"):
+    def __init__(
+        self,
+        prompt_template_path: str = "prompts/judge_prompt.md",
+        pairrm_ranker: Optional['PairRMRanker'] = None,
+        llm_client: Optional['LLMClient'] = None,
+        use_pairrm: Optional[bool] = None,
+        use_llm_tiebreaker: bool = False
+    ):
+        """
+        Инициализация JudgeAgent
+
+        Args:
+            prompt_template_path: Путь к промпт-шаблону
+            pairrm_ranker: PairRM ranker (если None, создастся автоматически)
+            llm_client: LLM клиент для tiebreaker (если None, создастся автоматически)
+            use_pairrm: Использовать ли PairRM (если None, берется из settings)
+            use_llm_tiebreaker: Использовать ли LLM для разрешения сложных случаев
+        """
         super().__init__(prompt_template_path)
+
+        # Настройка режимов
+        self.use_pairrm = use_pairrm if use_pairrm is not None else settings.USE_PAIRRM
+        self.use_llm_tiebreaker = use_llm_tiebreaker and HAS_LLM
+
+        # Уровень 1: PairRM (preferred)
+        if self.use_pairrm and HAS_PAIRRM:
+            try:
+                self.ranker = pairrm_ranker or PairRMRanker()
+                logger.info("JudgeAgent: используется PairRM для ранжирования")
+            except Exception as e:
+                logger.error(f"Не удалось инициализировать PairRM: {e}")
+                self.ranker = None
+                self.use_pairrm = False
+        else:
+            self.ranker = None
+            if not HAS_PAIRRM:
+                logger.warning("PairRM недоступен (нет transformers/torch)")
+
+        # Уровень 2: LLM tiebreaker (optional)
+        if self.use_llm_tiebreaker:
+            try:
+                self.llm = llm_client or get_default_llm(temperature=0.2)
+                logger.info("JudgeAgent: LLM tiebreaker включен")
+            except Exception as e:
+                logger.warning(f"LLM tiebreaker недоступен: {e}")
+                self.llm = None
+                self.use_llm_tiebreaker = False
+        else:
+            self.llm = None
+
+        # Уровень 3: Эвристики (fallback)
+        logger.info("JudgeAgent: эвристики доступны как fallback")
+
+        # Статистика
+        self.judgment_stats = {
+            'total_pairs': 0,
+            'pairrm_used': 0,
+            'llm_used': 0,
+            'heuristic_used': 0,
+            'ties': 0,
+            'uncertain': 0
+        }
 
     def process(
         self,
@@ -141,6 +229,11 @@ class JudgeAgent(BaseAgent):
         """
         Оценка пары по одному критерию
 
+        Использует 3-уровневую стратегию:
+        1. PairRM (если доступен) - SOTA модель
+        2. LLM tiebreaker (если включен и PairRM дал tie)
+        3. Эвристики (fallback)
+
         Args:
             candidate_1: Текст первого кандидата
             candidate_2: Текст второго кандидата
@@ -151,6 +244,38 @@ class JudgeAgent(BaseAgent):
         Returns:
             Оценка: 'A+' (первый лучше), 'B+' (второй лучше), 'tie' (паритет)
         """
+        # Уровень 1: PairRM
+        if self.use_pairrm and self.ranker:
+            try:
+                result = self._evaluate_with_pairrm(
+                    candidate_1, candidate_2, claim_a, claim_b, criterion_id
+                )
+
+                # Если PairRM дал уверенный результат, используем его
+                if result != 'tie' or not self.use_llm_tiebreaker:
+                    self.judgment_stats['pairrm_used'] += 1
+                    return result
+
+                # Если tie и есть LLM tiebreaker, используем его
+                if self.use_llm_tiebreaker and self.llm:
+                    logger.debug(f"PairRM дал tie для {criterion_id}, используем LLM tiebreaker")
+                    llm_result = self._evaluate_with_llm(
+                        candidate_1, candidate_2, criterion_id
+                    )
+                    if llm_result != 'tie':
+                        self.judgment_stats['llm_used'] += 1
+                        return llm_result
+
+                self.judgment_stats['pairrm_used'] += 1
+                return result
+
+            except Exception as e:
+                logger.error(f"Ошибка в PairRM оценке: {e}")
+                logger.warning("Переключаемся на эвристики")
+
+        # Уровень 2/3: Эвристики (fallback)
+        self.judgment_stats['heuristic_used'] += 1
+
         if criterion_id == 'C1':  # Корректность фактов
             return self._evaluate_correctness(claim_a, claim_b)
 
@@ -167,6 +292,94 @@ class JudgeAgent(BaseAgent):
             return self._evaluate_verifiability(claim_a, claim_b)
 
         return 'tie'
+
+    def _evaluate_with_pairrm(
+        self,
+        candidate_1: str,
+        candidate_2: str,
+        claim_a: Dict,
+        claim_b: Dict,
+        criterion_id: str
+    ) -> str:
+        """
+        Оценка с использованием PairRM
+
+        Args:
+            candidate_1: Текст первого кандидата
+            candidate_2: Текст второго кандидата
+            claim_a: Полный объект первого тезиса
+            claim_b: Полный объект второго тезиса
+            criterion_id: Идентификатор критерия
+
+        Returns:
+            Результат: 'A+', 'B+', или 'tie'
+        """
+        # Формируем instruction для PairRM на основе критерия
+        criterion_name = self.CRITERIA[criterion_id]
+        instruction = f"Сравните два текста по критерию: {criterion_name}. Какой текст лучше?"
+
+        # Вызываем PairRM
+        result = self.ranker.compare(
+            text_a=candidate_1,
+            text_b=candidate_2,
+            instruction=instruction,
+            tie_threshold=0.1  # Порог для определения паритета
+        )
+
+        # Конвертируем результат PairRM в формат JudgeAgent
+        if result.winner == 'A':
+            return 'A+'
+        elif result.winner == 'B':
+            return 'B+'
+        else:
+            return 'tie'
+
+    def _evaluate_with_llm(
+        self,
+        candidate_1: str,
+        candidate_2: str,
+        criterion_id: str
+    ) -> str:
+        """
+        LLM tiebreaker для сложных случаев
+
+        Args:
+            candidate_1: Текст первого кандидата
+            candidate_2: Текст второго кандидата
+            criterion_id: Идентификатор критерия
+
+        Returns:
+            Результат: 'A+', 'B+', или 'tie'
+        """
+        criterion_name = self.CRITERIA[criterion_id]
+
+        prompt = f"""Сравни два текста по критерию: {criterion_name}
+
+Текст А: {candidate_1}
+
+Текст Б: {candidate_2}
+
+Ответь кратко (одно слово):
+- "A" если текст А лучше
+- "B" если текст Б лучше
+- "tie" если паритет
+
+Ответ:"""
+
+        try:
+            response = self.llm.generate(prompt, temperature=0.2, max_tokens=10)
+            answer = response.text.strip().lower()
+
+            if 'a' in answer and 'b' not in answer:
+                return 'A+'
+            elif 'b' in answer:
+                return 'B+'
+            else:
+                return 'tie'
+
+        except Exception as e:
+            logger.error(f"Ошибка в LLM tiebreaker: {e}")
+            return 'tie'
 
     def _evaluate_correctness(self, claim_a: Dict, claim_b: Dict) -> str:
         """Оценка корректности фактов"""
@@ -416,6 +629,42 @@ class JudgeAgent(BaseAgent):
 
 Выполни оценку согласно критериям выше.
 """
+
+    def get_judgment_stats(self) -> Dict:
+        """
+        Получить статистику судейства
+
+        Returns:
+            Словарь со статистикой использования разных методов
+        """
+        stats = self.judgment_stats.copy()
+
+        # Подсчет процентов
+        total_evaluations = (
+            stats['pairrm_used'] +
+            stats['llm_used'] +
+            stats['heuristic_used']
+        )
+
+        if total_evaluations > 0:
+            stats['pairrm_pct'] = (stats['pairrm_used'] / total_evaluations) * 100
+            stats['llm_pct'] = (stats['llm_used'] / total_evaluations) * 100
+            stats['heuristic_pct'] = (stats['heuristic_used'] / total_evaluations) * 100
+
+        # Информация о режиме
+        if self.use_pairrm and self.ranker:
+            stats['mode'] = 'PairRM + Heuristics'
+            if self.use_llm_tiebreaker:
+                stats['mode'] = 'PairRM + LLM + Heuristics'
+        else:
+            stats['mode'] = 'Heuristics only'
+
+        # Информация о модели PairRM
+        if self.ranker:
+            pairrm_stats = self.ranker.get_stats()
+            stats['pairrm_model_stats'] = pairrm_stats
+
+        return stats
 
 
 # Пример использования

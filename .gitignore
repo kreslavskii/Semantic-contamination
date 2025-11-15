@@ -69,7 +69,10 @@ __pycache__/
 .ruff_cache/
 
 # Model files (downloaded on first run)
-models/
+# Note: We track src/models/ as source code
+# Downloaded model binaries go in .cache/ or data/models/
+.cache/models/
+data/models/
 *.bin
 *.pt
 *.pth
