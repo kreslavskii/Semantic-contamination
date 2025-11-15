@@ -1,17 +1,82 @@
 """
 Агент для семантического сопоставления и типизации отношений между тезисами (Шаг 4)
+
+ОБНОВЛЕНО (Шаг 7):
+- Добавлена LLM-based semantic matching вместо word overlap
+- Интегрирован Concise Chain-of-Thought (CoT) для reasoning
+- Сохранены эвристики как fallback
+- 2-уровневая graceful degradation
 """
-from typing import List, Dict, Tuple, Set
+from typing import List, Dict, Tuple, Set, Optional
 from .base_agent import BaseAgent
 import re
+import logging
+
+# LLM imports (опциональные)
+try:
+    from ..llm import get_default_llm, LLMClient
+    HAS_LLM = True
+except ImportError:
+    HAS_LLM = False
+    get_default_llm = None
+    LLMClient = None
+
+from ..config import settings
+
+logger = logging.getLogger(__name__)
 
 
 class AlignerAgent(BaseAgent):
     """Агент для определения семантических отношений между тезисами"""
 
-    def __init__(self, prompt_template_path: str = "prompts/aligner_prompt.md"):
+    def __init__(
+        self,
+        prompt_template_path: str = "prompts/aligner_prompt.md",
+        llm_client: Optional['LLMClient'] = None,
+        use_llm: Optional[bool] = None
+    ):
+        """
+        Инициализация AlignerAgent
+
+        Args:
+            prompt_template_path: Путь к промпт-шаблону
+            llm_client: LLM клиент (если None, создастся автоматически)
+            use_llm: Использовать ли LLM для semantic matching (если None, берется из settings)
+        """
         super().__init__(prompt_template_path)
         self.conflicts = []
+
+        # Настройка режимов
+        self.use_llm = use_llm if use_llm is not None else (HAS_LLM and settings.can_use_llm)
+
+        # Уровень 1: LLM semantic matching (preferred)
+        if self.use_llm and HAS_LLM:
+            try:
+                self.llm = llm_client or get_default_llm(temperature=0.2)
+                logger.info("AlignerAgent: используется LLM для semantic matching")
+            except Exception as e:
+                logger.error(f"Не удалось инициализировать LLM: {e}")
+                self.llm = None
+                self.use_llm = False
+        else:
+            self.llm = None
+            if not HAS_LLM:
+                logger.warning("LLM недоступен (нет openai/anthropic)")
+
+        # Уровень 2: Эвристики (fallback)
+        logger.info("AlignerAgent: эвристики доступны как fallback")
+
+        # Статистика
+        self.alignment_stats = {
+            'total_pairs': 0,
+            'llm_analyzed': 0,
+            'heuristic_analyzed': 0,
+            'equivalent': 0,
+            'refines': 0,
+            'extends': 0,
+            'contradicts': 0,
+            'independent': 0
+        }
 
     def process(self, pairs: List[Dict], claims: List[Dict]) -> Tuple[List[Dict], List[Dict]]:
         """
@@ -46,6 +111,9 @@ class AlignerAgent(BaseAgent):
             # Обновляем запись пары
             updated_pair = {**pair, **analysis}
             updated_pairs.append(updated_pair)
+
+            # Обновляем статистику
+            self.alignment_stats['total_pairs'] += 1
 
             # Если есть конфликт, добавляем в список
             if analysis['relation'] == 'contradicts':
@@ -109,6 +177,10 @@ class AlignerAgent(BaseAgent):
         """
         Определение типа отношения между тезисами
 
+        Использует 2-уровневую стратегию:
+        1. LLM с Concise CoT (если доступно)
+        2. Эвристики (fallback)
+
         Args:
             text_a: Текст первого тезиса
             text_b: Текст второго тезиса
@@ -117,6 +189,92 @@ class AlignerAgent(BaseAgent):
 
         Returns:
             Тип отношения: equivalent, refines, extends, contradicts, independent
+        """
+        # Уровень 1: LLM semantic matching
+        if self.use_llm and self.llm:
+            try:
+                return self._determine_relation_with_llm(text_a, text_b, claim_a, claim_b)
+            except Exception as e:
+                logger.error(f"Ошибка в LLM relation detection: {e}")
+                logger.warning("Переключаемся на эвристики")
+
+        # Уровень 2: Эвристики (fallback)
+        return self._determine_relation_with_heuristics(text_a, text_b, claim_a, claim_b)
+
+    def _determine_relation_with_llm(
+        self,
+        text_a: str,
+        text_b: str,
+        claim_a: Dict,
+        claim_b: Dict
+    ) -> str:
+        """
+        Определение отношения с использованием LLM + Concise CoT
+
+        Args:
+            text_a: Текст первого тезиса
+            text_b: Текст второго тезиса
+            claim_a: Полный объект первого тезиса
+            claim_b: Полный объект второго тезиса
+
+        Returns:
+            Тип отношения
+        """
+        # Формируем Concise CoT промпт
+        prompt = f"""Определи семантическое отношение между двумя утверждениями. Используй краткую цепочку рассуждений.
+
+Утверждение A: {text_a}
+
+Утверждение B: {text_b}
+
+Дополнительный контекст:
+- Факты A: {claim_a.get('facts', 'нет')}
+- Факты B: {claim_b.get('facts', 'нет')}
+- Условия A: {self._format_scope(claim_a)}
+- Условия B: {self._format_scope(claim_b)}
+
+Типы отношений:
+- equivalent: утверждения выражают одно и то же (синонимы, перефразировки)
+- refines: одно уточняет другое (добавляет детали, конкретизирует)
+- extends: дополняют друг друга (разные аспекты одной темы)
+- contradicts: противоречат друг другу (несовместимые утверждения)
+- independent: не связаны по смыслу (разные темы)
+
+Рассуждение (2-3 предложения):
+1. Что общего между утверждениями?
+2. В чем ключевое различие?
+3. Какое отношение это означает?
+
+Ответ (одно слово): [equivalent/refines/extends/contradicts/independent]"""
+
+        response = self.llm.generate(prompt, temperature=0.2, max_tokens=300)
+
+        # Парсим ответ LLM
+        relation = self._parse_relation_from_llm(response.text)
+
+        self.alignment_stats['llm_analyzed'] += 1
+        self.alignment_stats[relation] += 1
+
+        return relation
+
+    def _determine_relation_with_heuristics(
+        self,
+        text_a: str,
+        text_b: str,
+        claim_a: Dict,
+        claim_b: Dict
+    ) -> str:
+        """
+        Fallback: определение отношения с использованием эвристик
+
+        Args:
+            text_a: Текст первого тезиса
+            text_b: Текст второго тезиса
+            claim_a: Полный объект первого тезиса
+            claim_b: Полный объект второго тезиса
+
+        Returns:
+            Тип отношения
         """
         # Вычисляем схожесть по словам
         words_a = set(self._tokenize(text_a.lower()))
@@ -129,24 +287,81 @@ class AlignerAgent(BaseAgent):
 
         # Проверяем на противоречия в фактах
         if self._has_contradicting_facts(claim_a, claim_b):
-            return 'contradicts'
-
+            relation = 'contradicts'
         # Высокая схожесть - эквивалентность
-        if jaccard > 0.7:
-            return 'equivalent'
-
+        elif jaccard > 0.7:
+            relation = 'equivalent'
         # Один текст существенно длиннее и содержит другой
-        if jaccard > 0.5:
-            if len(words_a) > len(words_b) * 1.5:
-                return 'refines'  # A детализирует B
-            elif len(words_b) > len(words_a) * 1.5:
-                return 'refines'  # B детализирует A
-
+        elif jaccard > 0.5:
+            if len(words_a) > len(words_b) * 1.5 or len(words_b) > len(words_a) * 1.5:
+                relation = 'refines'  # Один детализирует другой
+            else:
+                relation = 'extends'  # Оба дополняют
         # Средняя схожесть - дополнение
-        if jaccard > 0.3:
-            return 'extends'
-
+        elif jaccard > 0.3:
+            relation = 'extends'
         # Низкая схожесть - независимые
+        else:
+            relation = 'independent'
+
+        self.alignment_stats['heuristic_analyzed'] += 1
+        self.alignment_stats[relation] += 1
+
+        return relation
+
+    def _format_scope(self, claim: Dict) -> str:
+        """
+        Форматирование scope для промпта
+
+        Args:
+            claim: Тезис
+
+        Returns:
+            Строка с условиями
+        """
+        parts = []
+        if claim.get('scope.time'):
+            parts.append(f"время: {claim['scope.time']}")
+        if claim.get('scope.jurisdiction'):
+            parts.append(f"область: {claim['scope.jurisdiction']}")
+        if claim.get('scope.conditions'):
+            parts.append(f"условия: {claim['scope.conditions']}")
+
+        return ', '.join(parts) if parts else 'нет'
+
+    def _parse_relation_from_llm(self, llm_response: str) -> str:
+        """
+        Парсинг типа отношения из ответа LLM
+
+        Args:
+            llm_response: Текст ответа от LLM
+
+        Returns:
+            Тип отношения
+        """
+        # Нормализуем ответ
+        response_lower = llm_response.lower()
+
+        # Ищем ключевые слова в порядке приоритета
+        if 'equivalent' in response_lower:
+            return 'equivalent'
+        elif 'contradict' in response_lower:
+            return 'contradicts'
+        elif 'refine' in response_lower:
+            return 'refines'
+        elif 'extend' in response_lower:
+            return 'extends'
+        elif 'independent' in response_lower:
+            return 'independent'
+
+        # Если не нашли явного указания, берем последнее слово
+        last_line = llm_response.strip().split('\n')[-1].lower()
+        for relation in ['equivalent', 'contradicts', 'refines', 'extends', 'independent']:
+            if relation in last_line:
+                return relation
+
+        # Fallback - independent
+        logger.warning(f"Не удалось распарсить relation из LLM: {llm_response}")
         return 'independent'
 
     def _tokenize(self, text: str) -> List[str]:
@@ -410,6 +625,35 @@ class AlignerAgent(BaseAgent):
 
 Выполни анализ согласно инструкциям выше.
 """
+
+    def get_alignment_stats(self) -> Dict:
+        """
+        Получить статистику alignment
+
+        Returns:
+            Словарь со статистикой использования разных методов
+        """
+        stats = self.alignment_stats.copy()
+
+        total = stats['total_pairs']
+        if total > 0:
+            stats['llm_pct'] = (stats['llm_analyzed'] / total) * 100
+            stats['heuristic_pct'] = (stats['heuristic_analyzed'] / total) * 100
+
+            # Процентное распределение отношений
+            stats['equivalent_pct'] = (stats['equivalent'] / total) * 100
+            stats['refines_pct'] = (stats['refines'] / total) * 100
+            stats['extends_pct'] = (stats['extends'] / total) * 100
+            stats['contradicts_pct'] = (stats['contradicts'] / total) * 100
+            stats['independent_pct'] = (stats['independent'] / total) * 100
+
+        # Информация о режиме
+        if self.use_llm and self.llm:
+            stats['mode'] = 'LLM + Concise CoT + Heuristics'
+        else:
+            stats['mode'] = 'Heuristics only'
+
+        return stats
 
 
 # Пример использования
