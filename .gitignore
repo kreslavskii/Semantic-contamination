@@ -54,3 +54,38 @@ data/*.txt
 # Temporary files
 tmp/
 temp/
+
+# Environment variables (CRITICAL: never commit API keys!)
+.env
+.env.local
+.env.*.local
+
+# Cache directories
+.cache/
+cache/
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Model files (downloaded on first run)
+models/
+*.bin
+*.pt
+*.pth
+*.safetensors
+
+# LangChain cache
+.langchain/
+
+# Coverage reports
+.coverage
+htmlcov/
+coverage.xml
+
+# Jupyter notebooks checkpoints
+.ipynb_checkpoints/
+
+# Profiling data
+*.prof
+*.lprof
